@@ -1,31 +1,61 @@
 # 🎓 AI Course Generator
 
-An AI-powered course generator built with **LangGraph** and **GPT-4o** that automatically creates structured learning materials on any topic — including session-by-session theory documents and executable Jupyter notebooks.
+An AI-powered course generator built with **LangGraph** and **GPT-4o** that creates fully structured learning materials on any topic — complete with session theory documents and executable Jupyter notebooks, tailored to the student's profile through an interactive interview.
 
 ---
 
-## 🧠 What it does
+## ✨ Features
 
-Given a topic (e.g. *"Seaborn"*, *"FastAPI"*, *"Reinforcement Learning"*) and a time structure (e.g. 4 hours split into 2-hour sessions), the agent:
-
-1. **Plans** a full course syllabus with progressive session topics
-2. **Writes** detailed theory for each session in Markdown
-3. **Generates** a ready-to-run Jupyter notebook (`.ipynb`) per session
-4. **Saves** everything to a structured `output/` folder
+- **Interactive onboarding** — the agent interviews you before generating anything, adapting the course to your level, goals, and preferences
+- **Human-in-the-loop validation** — review and request changes to the syllabus before any content is generated
+- **Pedagogy-first content** — all material follows an Anchor → Teach → Apply structure designed for fast learners
+- **Granular notebook generation** — notebooks are built section by section per topic (intro, concept blocks, exercises), avoiding LLM token limits
+- **Automatic code validation** — every code cell is executed in a subprocess; failures are sent back to the LLM for fixing before saving
+- **Session continuity** — each session generates a summary injected as context into the next, avoiding repetition
 
 ---
 
 ## 🏗️ Architecture
 
-The project uses a **LangGraph state machine** with a conditional loop — no unnecessary supervisor agent:
+The project uses a **LangGraph state machine** with conditional edges and human-in-the-loop interrupts:
 
 ```
-START → [planner] → [theory_writer] → [notebook_writer] → (more sessions?) → [theory_writer] ...
-                                                                ↓ (done)
-                                                         [save_outputs] → END
+START
+  │
+  ▼
+[interviewer] ◄──────────────────────────────┐
+  │  interrupt()                              │
+  ▼                                           │
+[evaluate_interview] ── "needs more" ─────────┘
+  │ "ready"
+  ▼
+[planner] ◄──────────────────────────────────┐
+  │                                           │
+  ▼                                           │
+[validate_syllabus]  ── "revise" ─────────────┘
+  │  interrupt()
+  │ "approved"
+  ▼
+[theory_writer]  ◄─────────────────────────────┐
+  │                                             │
+  ▼                                             │
+[notebook_section] ◄──┐                         │
+  │                   │ more sections            │
+  ▼                   │                         │
+route ────────────────┘                         │
+  │ all sections done                           │
+  ▼                                             │
+[validate_code] ◄──┐                            │
+  │                │ failures + retries left     │
+  ▼                │                            │
+route ─────────────┘                            │
+  │ clean (or max retries)                      │
+  ▼                                             │
+[advance_topic] ── more topics ─────────────────┘
+  │ session complete          more sessions ────┘
+  ▼
+[save_outputs] → END
 ```
-
-The conditional edge in `notebook_writer` checks whether all sessions have been processed and either loops back or terminates.
 
 ---
 
@@ -35,7 +65,7 @@ The conditional edge in `notebook_writer` checks whether all sessions have been 
 ai-course-generator/
 ├── state.py          # Pydantic models for graph state
 ├── prompts.py        # All LLM prompt templates
-├── main.py           # LangGraph graph definition + entry point
+├── main.py           # LangGraph graph + all nodes + entry point
 ├── .env.example      # Environment variable template
 ├── requirements.txt
 └── output/           # Generated courses (git-ignored)
@@ -50,27 +80,58 @@ class SessionPlan(BaseModel):
     topics: list[str]
     duration_hours: float
 
+class CodeValidationResult(BaseModel):
+    cell_index: int
+    success: bool
+    error: str = ""
+    fixed_source: list[str] = []
+
 class CourseState(BaseModel):
-    topic: str
-    total_hours: float
-    session_hours: float
-    num_sessions: int = 0
-    syllabus: list[SessionPlan] = []
-    current_session: int = 0
-    theory_docs: list[str] = []
-    notebooks: list[dict] = []
+    # input, interview state, syllabus, granular progress,
+    # session continuity summaries, generated output, validation results
 ```
 
 ### `prompts.py` — Prompt templates
 
-Contains three prompt templates:
-- `PLANNER_PROMPT` — generates the syllabus as structured JSON
-- `THEORY_PROMPT` — writes detailed markdown theory for a session
-- `NOTEBOOK_PROMPT` — generates `.ipynb` cell content for a session
+| Prompt | Purpose |
+|--------|---------|
+| `INTERVIEWER_PROMPT` | Generates dynamic questions to profile the student |
+| `INTERVIEW_EVALUATOR_PROMPT` | Decides if enough info has been gathered |
+| `PLANNER_PROMPT` | Builds the syllabus following Anchor→Teach→Apply pedagogy |
+| `THEORY_PROMPT` | Writes topic theory: anchor, explanation, inline example, key takeaways |
+| `NOTEBOOK_SECTION_PROMPT` | Generates one notebook section: intro / concept block / exercises |
+| `CODE_FIX_PROMPT` | Repairs a failing code cell given its error message |
+| `SUMMARY_PROMPT` | Summarises a completed session for continuity context |
 
-### `main.py` — Graph
+### `main.py` — Graph nodes
 
-Defines the four nodes (`planner`, `theory_writer`, `notebook_writer`, `save_outputs`), wires them together with a conditional loop, and exposes a `run_course_generator()` entry point.
+| Node | Role |
+|------|------|
+| `interviewer` | LLM generates questions, `interrupt()` waits for user answers |
+| `evaluate_interview` | Decides if another round is needed (max 3 rounds) |
+| `planner` | Generates or revises the syllabus |
+| `validate_syllabus` | Shows syllabus to user, `interrupt()` waits for approval |
+| `theory_writer` | Writes theory per topic, computes dynamic section count |
+| `notebook_section` | Generates one notebook section via `llm_large` (16k tokens) |
+| `validate_code` | Executes cells cumulatively in a subprocess, LLM-fixes failures |
+| `advance_topic` | Advances progress counter, assembles session notebook |
+| `save_outputs` | Writes `.md` theory files, `.ipynb` notebooks, and `README.md` |
+
+---
+
+## 🔑 Key design decisions
+
+**No supervisor agent** — the flow is deterministic. A conditional edge handles the session/topic loop cleanly without adding an extra LLM call for routing.
+
+**Pydantic over TypedDict** — stronger validation, better IDE support, and cleaner serialisation across checkpoint saves.
+
+**Dynamic notebook sections** — `total_notebook_sections` is computed per topic based on its complexity, not hardcoded. Range: 3–6 sections.
+
+**Cumulative code execution** — cells are validated by running all preceding cells together in a single subprocess, correctly simulating notebook state (imports, variables, dataframes defined earlier are available).
+
+**Two LLM instances** — `llm` (8k tokens) for short structured tasks; `llm_large` (16k tokens) only for notebook sections where output can be very long.
+
+**Resilient JSON parsing** — `_safe_parse_cells()` recovers truncated LLM responses by finding the last complete JSON object rather than crashing.
 
 ---
 
@@ -88,11 +149,7 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env and add your OpenAI key
-```
-
-```env
-OPENAI_API_KEY=sk-your-key-here
+# Add your OpenAI key to .env
 ```
 
 ### 3. Run
@@ -101,7 +158,9 @@ OPENAI_API_KEY=sk-your-key-here
 python main.py
 ```
 
-By default it generates a **Seaborn** course (4h / 2 sessions). To change it, edit the bottom of `main.py`:
+The agent will interview you, propose a syllabus for your approval, then generate all content automatically.
+
+To change the topic, edit the bottom of `main.py`:
 
 ```python
 run_course_generator(
@@ -119,11 +178,15 @@ For `topic="Seaborn", total_hours=4, session_hours=2`:
 
 ```
 output/seaborn/
-├── README.md                                        ← full syllabus
-├── session_01_introduction_to_seaborn_theory.md
-├── session_01_introduction_to_seaborn.ipynb
-├── session_02_advanced_visualizations_theory.md
-└── session_02_advanced_visualizations.ipynb
+├── README.md
+├── session_01_foundations_topic_01_figure_anatomy.md
+├── session_01_foundations_topic_02_color_palettes.md
+├── session_01_foundations_topic_03_mini_project.md
+├── session_01_foundations.ipynb
+├── session_02_statistical_plots_topic_01_distributions.md
+├── session_02_statistical_plots_topic_02_relationships.md
+├── session_02_statistical_plots_topic_03_mini_project.md
+└── session_02_statistical_plots.ipynb
 ```
 
 ---
@@ -132,19 +195,10 @@ output/seaborn/
 
 | Tool | Role |
 |------|------|
-| [LangGraph](https://github.com/langchain-ai/langgraph) | Agent graph orchestration |
+| [LangGraph](https://github.com/langchain-ai/langgraph) | State machine orchestration with human-in-the-loop |
 | [LangChain OpenAI](https://python.langchain.com/) | GPT-4o integration |
-| [Pydantic v2](https://docs.pydantic.dev/) | State validation and modeling |
-| GPT-4o | Course planning, theory writing, notebook generation |
-
----
-
-## 💡 Design decisions
-
-- **No supervisor agent** — the flow is deterministic, so a supervisor would only add latency and cost. A conditional edge handles the session loop cleanly.
-- **Pydantic over TypedDict** — stronger validation, better IDE support, and cleaner serialization.
-- **Prompts as a separate module** — makes it easy to iterate on prompt quality without touching the graph logic.
-- **Self-contained notebooks** — all generated code uses built-in datasets (seaborn, sklearn) so notebooks run without extra setup.
+| [Pydantic v2](https://docs.pydantic.dev/) | State validation and modelling |
+| GPT-4o | All LLM tasks |
 
 ---
 
