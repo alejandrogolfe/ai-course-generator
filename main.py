@@ -21,10 +21,21 @@ from prompts import (
 )
 from state import CodeValidationResult, CourseState, SessionPlan
 
-load_dotenv()
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0.3, max_tokens=8192)
-llm_large = ChatOpenAI(model="gpt-4o", temperature=0.3, max_tokens=16000)
+load_dotenv(override=True)
+
+
+llm = ChatOpenAI(
+    model="gpt-4o",
+    temperature=0.3,
+    max_tokens=8192,
+).with_config({"tags": ["llm-standard"]})
+
+llm_large = ChatOpenAI(
+    model="gpt-4o",
+    temperature=0.3,
+    max_tokens=16000,
+).with_config({"tags": ["llm-large"]})
 
 
 # ---------------------------------------------------------------------------
@@ -52,13 +63,11 @@ def _safe_parse_cells(text: str) -> list[dict]:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         # Find the last complete cell by looking for the last "}," or "}" before end
-        last_close = max(cleaned.rfind("},"), cleaned.rfind("}
-]"), cleaned.rfind("}]"))
+        last_close = max(cleaned.rfind("},"), cleaned.rfind("}\n]"), cleaned.rfind("}]"))
         if last_close == -1:
             raise ValueError(f"Could not recover truncated JSON. Raw response:\n{cleaned[:300]}")
         # Truncate at last complete object and close the array
-        recovered = cleaned[:last_close + 1] + "
-]"
+        recovered = cleaned[:last_close + 1] + "]"
         try:
             cells = json.loads(recovered)
             print(f"   WARNING: JSON was truncated, recovered {len(cells)} cells from partial response")
@@ -207,7 +216,12 @@ Please revise the syllabus accordingly.
     )
 
     response = llm.invoke(prompt)
-    sessions_data = json.loads(_strip_json(response.content))
+    try:
+        sessions_data = json.loads(_strip_json(response.content))
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Planner returned invalid JSON: {e}\nRaw response:\n{response.content[:300]}"
+        )
     syllabus = [SessionPlan(**s) for s in sessions_data]
 
     print(f"   Syllabus ready: {len(syllabus)} sessions")
@@ -281,7 +295,6 @@ def theory_writer_node(state: CourseState) -> dict:
 
 
 def notebook_section_node(state: CourseState) -> dict:
-    """Generates one section of the notebook for the current topic."""
     session = state.syllabus[state.current_session]
     topic = session.topics[state.current_topic]
     section_idx = state.current_notebook_section
@@ -291,6 +304,38 @@ def notebook_section_node(state: CourseState) -> dict:
     print(f"   Notebook section '{section_name}' "
           f"({section_idx + 1}/{total_sections}) for '{topic}'")
 
+    # Ejercicios: 3 llamadas separadas en lugar de una
+    if section_name == "exercises":
+        all_cells = []
+        for exercise_num in range(1, 4):
+            prompt = NOTEBOOK_SECTION_PROMPT.format(
+                course_topic=state.topic,
+                session_number=session.session_number,
+                session_title=session.title,
+                current_topic=topic,
+                section_name=f"exercises",
+                section_index=section_idx + 1,
+                total_sections=total_sections,
+                user_answers=state.user_answers,
+                previous_context=_previous_context(state),
+            ) + f"""
+
+                IMPORTANT: Generate ONLY exercise {exercise_num} of 3.
+                Return exactly 2 cells: one markdown cell and one code cell.
+                Keep the markdown description under 3 sentences.
+                Keep the code cell under 15 lines.
+                Valid closed JSON is mandatory — do not write more than this."""
+
+            response = llm.invoke(prompt)  # llm normal es suficiente para 1 ejercicio
+            cells = _safe_parse_cells(response.content)
+            all_cells.extend(cells)
+
+        return {
+            "current_session_cells": state.current_session_cells + all_cells,
+            "current_notebook_section": section_idx + 1,
+        }
+
+    # Resto de secciones: comportamiento original
     prompt = NOTEBOOK_SECTION_PROMPT.format(
         course_topic=state.topic,
         session_number=session.session_number,
@@ -305,10 +350,9 @@ def notebook_section_node(state: CourseState) -> dict:
 
     response = llm_large.invoke(prompt)
     new_cells = _safe_parse_cells(response.content)
-    updated_cells = state.current_session_cells + new_cells
 
     return {
-        "current_session_cells": updated_cells,
+        "current_session_cells": state.current_session_cells + new_cells,
         "current_notebook_section": section_idx + 1,
     }
 
@@ -347,7 +391,7 @@ def validate_code_node(state: CourseState) -> dict:
             print(f"      Cell {i}: skipped (exercise placeholder)")
             continue
 
-        success, error = _execute_cells_cumulative(cells, i)
+        success, error = _execute_cells_cumulative(fixed_cells, i)
 
         if success:
             results.append(CodeValidationResult(cell_index=i, success=True))
@@ -463,7 +507,7 @@ def advance_topic_node(state: CourseState) -> dict:
 
 def save_outputs_node(state: CourseState) -> dict:
     """Saves all generated content to disk."""
-    output_dir = Path("output") / state.topic.replace(" ", "_").lower()
+    output_dir = Path("/opt/project/output") / state.topic.replace(" ", "_").lower()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n Saving course to: {output_dir}/")
@@ -522,9 +566,10 @@ def route_after_validation_syllabus(state: CourseState) -> str:
 
 
 def route_after_notebook_section(state: CourseState) -> str:
-    """More sections for this topic? Or validate and advance?"""
     if state.current_notebook_section < state.total_notebook_sections:
         return "notebook_section"
+    if not state.validate_code:  # nuevo
+        return "advance_topic"
     return "validate_code"
 
 
@@ -587,13 +632,22 @@ def run_course_generator(topic: str, total_hours: float, session_hours: float):
     num_sessions = int(total_hours / session_hours)
     app = build_graph()
 
-    config = {"configurable": {"thread_id": f"{topic.replace(' ', '_').lower()}_001"}}
+    config = {
+        "configurable": {"thread_id": f"{topic.replace(' ', '_').lower()}_001"},
+        "metadata": {
+            "topic": topic,
+            "total_hours": total_hours,
+            "session_hours": session_hours,
+        },
+        "tags": ["course-generator"],
+    }
 
     initial_state = CourseState(
         topic=topic,
         total_hours=total_hours,
         session_hours=session_hours,
         num_sessions=num_sessions,
+        validate_code=False,
     )
 
     print(f"\n Starting course generator for: '{topic}'")
@@ -604,6 +658,7 @@ def run_course_generator(topic: str, total_hours: float, session_hours: float):
     while True:
         for event in app.stream(input_data, config=config, stream_mode="updates"):
             pass
+        input_data = None  # reset: subsequent iterations resume from checkpoint
 
         snapshot = app.get_state(config)
 

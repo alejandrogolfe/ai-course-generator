@@ -159,6 +159,11 @@ Rules:
 - Use only built-in datasets: seaborn.load_dataset(), sklearn.datasets, or generate synthetic data with numpy
 - Build on previous sessions — don't re-explain basics already covered
 - Never use placeholder variable names like foo, bar, x1, x2 — use meaningful names
+CRITICAL: You MUST close all JSON strings, arrays and objects properly.
+If you are running low on space, write shorter exercise descriptions —
+but NEVER leave a string or array unclosed. Valid JSON is mandatory.
+- NEVER use shell commands with ! prefix (such as !pip install or !python -m pip).
+  Assume all libraries are pre-installed. Just import them directly.
 """
 
 
@@ -182,6 +187,8 @@ Common issues to check:
 
 Return ONLY the fixed cell source as a JSON array of strings, one string per line (no markdown fences):
 ["line 1\\n", "line 2\\n", ...]
+- Remove any !pip install or shell commands (! prefix) — these are not valid 
+  Python, assume all libraries are pre-installed.
 """
 
 

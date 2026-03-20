@@ -53,4 +53,5 @@ class CourseState(BaseModel):
     # --- Validación de código ---
     validation_results: list[CodeValidationResult] = Field(default_factory=list)
     validation_attempts: int = 0
-    max_validation_attempts: int = 2
+    max_validation_attempts: int = 4
+    validate_code: bool = True
